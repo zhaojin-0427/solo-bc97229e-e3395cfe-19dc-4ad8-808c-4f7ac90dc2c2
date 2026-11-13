@@ -1,0 +1,21 @@
+services:
+  web:
+    build: .
+    container_name: env-warehouse
+    ports:
+      - "8000:8000"
+    volumes:
+      - warehouse_data:/data
+    environment:
+      # 重建节流参数，调大可在演示时看清后台进度；生产可调小
+      REBUILD_PAGE_SIZE: "10"
+      REBUILD_SLEEP: "0.15"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/results')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  warehouse_data:

@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>环境检测数仓 · 批次管理</title>
+<style>
+  :root { --bd:#d9dee7; --bg:#f5f7fa; --pri:#2563eb; --ok:#15803d; --warn:#b45309; --bad:#b91c1c; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:"PingFang SC","Microsoft YaHei",system-ui,sans-serif; background:var(--bg); color:#1f2937; }
+  header { background:#0f172a; color:#fff; padding:16px 28px; }
+  header h1 { margin:0; font-size:20px; }
+  header p { margin:6px 0 0; font-size:13px; color:#94a3b8; }
+  main { max-width:1080px; margin:24px auto; padding:0 20px; display:grid; gap:20px; }
+  .card { background:#fff; border:1px solid var(--bd); border-radius:10px; padding:18px 20px; }
+  .card h2 { margin:0 0 12px; font-size:16px; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+  button { border:0; border-radius:8px; padding:9px 18px; font-size:14px; cursor:pointer; background:var(--pri); color:#fff; }
+  button.secondary { background:#475569; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  input[type=file] { font-size:14px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { border-bottom:1px solid var(--bd); padding:8px 10px; text-align:left; }
+  th { background:#f1f5f9; position:sticky; top:0; }
+  .tag { display:inline-block; padding:2px 10px; border-radius:999px; font-size:12px; }
+  .tag.active { background:#dcfce7; color:var(--ok); }
+  .tag.revoking { background:#fef3c7; color:var(--warn); }
+  .tag.revoked { background:#fee2e2; color:var(--bad); }
+  .tag.pending, .tag.running { background:#fef3c7; color:var(--warn); }
+  .tag.done { background:#dcfce7; color:var(--ok); }
+  .tag.failed { background:#fee2e2; color:var(--bad); }
+  .bar { height:10px; background:#e5e7eb; border-radius:999px; overflow:hidden; min-width:160px; }
+  .bar > i { display:block; height:100%; background:var(--pri); transition:width .3s; }
+  #msg { min-height:22px; font-size:14px; }
+  #msg.ok { color:var(--ok); } #msg.err { color:var(--bad); }
+  .muted { color:#64748b; font-size:12px; }
+  .scroll { max-height:340px; overflow:auto; }
+  code { background:#f1f5f9; padding:1px 6px; border-radius:4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>环境检测数据仓库 · 批次导入与撤销</h1>
+  <p>同键取最大未撤销批次 · 撤销在后台影子重建并原子切换 · 重建期间可继续导入</p>
+</header>
+<main>
+  <section class="card">
+    <h2>① 上传原始 CSV 批次</h2>
+    <div class="row">
+      <input type="file" id="file" accept=".csv,text/csv">
+      <button id="btnUpload">上传导入</button>
+      <span class="muted">列：站点, 采样日, 检测项目, 结果（批内前三列组合须唯一）</span>
+    </div>
+    <div id="msg"></div>
+  </section>
+
+  <section class="card">
+    <h2>② 批次列表与撤销</h2>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>批次号</th><th>文件</th><th>行数</th><th>状态</th><th>导入时间 (UTC)</th><th>操作</th></tr></thead>
+        <tbody id="batchBody"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>③ 撤销任务进度（同一时刻仅一项）</h2>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>任务</th><th>撤销批次</th><th>状态</th><th>进度</th><th>快照批次</th><th>错误信息</th></tr></thead>
+        <tbody id="jobBody"><tr><td colspan="6" class="muted">暂无任务</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>④ 当前正式结果
+      <span class="muted">（每次读取均为切换前或后的完整一致状态）</span>
+      <a href="/api/results.csv" style="float:right"><button class="secondary" type="button">下载当前结果 CSV</button></a>
+    </h2>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>站点</th><th>采样日</th><th>检测项目</th><th>结果</th><th>来源批次</th></tr></thead>
+        <tbody id="resultBody"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function showMsg(text, ok) {
+  const el = $('msg');
+  el.textContent = text;
+  el.className = ok ? 'ok' : 'err';
+}
+
+async function refresh() {
+  const [b, j, r] = await Promise.all([
+    fetch('/api/batches').then(r => r.json()),
+    fetch('/api/jobs').then(r => r.json()),
+    fetch('/api/results').then(r => r.json()),
+  ]);
+
+  const busy = j.some(x => x.status === 'pending' || x.status === 'running');
+
+  $('batchBody').innerHTML = b.length ? b.map(x => `
+    <tr>
+      <td>${x.batch_id}</td><td>${esc(x.filename)}</td><td>${x.row_count}</td>
+      <td><span class="tag ${x.status}">${x.status}</span></td>
+      <td>${esc(x.imported_at)}</td>
+      <td>${x.status === 'active'
+        ? `<button onclick="revoke(${x.batch_id})" ${busy ? 'disabled' : ''}>撤销</button>`
+        : '<span class="muted">—</span>'}</td>
+    </tr>`).join('') : '<tr><td colspan="6" class="muted">暂无批次</td></tr>';
+
+  $('jobBody').innerHTML = j.length ? j.map(x => {
+    const pct = x.keys_total ? Math.round(100 * x.keys_done / x.keys_total) : 0;
+    return `<tr>
+      <td>${x.job_id}</td><td>${x.batch_id}</td>
+      <td><span class="tag ${x.status}">${x.status}</span></td>
+      <td><div class="row"><div class="bar"><i style="width:${pct}%"></i></div>
+        <span class="muted">${x.keys_done}/${x.keys_total} (${pct}%)</span></div></td>
+      <td>${x.snapshot_batch ?? ''}</td><td>${x.error ? esc(x.error) : ''}</td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="6" class="muted">暂无任务</td></tr>';
+
+  $('resultBody').innerHTML = r.length ? r.map(x => `
+    <tr><td>${esc(x.station)}</td><td>${esc(x.sample_day)}</td><td>${esc(x.analyte)}</td>
+        <td>${x.result}</td><td>${x.source_batch}</td></tr>`).join('')
+    : '<tr><td colspan="5" class="muted">当前无正式结果（所有键均已随撤销删除）</td></tr>';
+
+  return busy;
+}
+
+async function loop() {
+  const busy = await refresh().catch(() => false);
+  setTimeout(loop, busy ? 1000 : 3000);
+}
+
+$('btnUpload').onclick = async () => {
+  const f = $('file').files[0];
+  if (!f) return showMsg('请先选择 CSV 文件', false);
+  const fd = new FormData();
+  fd.append('file', f);
+  const res = await fetch('/api/upload', { method: 'POST', body: fd });
+  const data = await res.json();
+  showMsg(data.message || data.error, data.ok);
+  if (data.ok) $('file').value = '';
+  refresh();
+};
+
+window.revoke = async (batchId) => {
+  if (!confirm(`确认撤销批次 ${batchId}？该批将永久失效且不可恢复。`)) return;
+  const res = await fetch('/api/revoke', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ batch_id: batchId }),
+  });
+  const data = await res.json();
+  showMsg(data.message || data.error, data.ok);
+  refresh();
+};
+
+loop();
+</script>
+</body>
+</html>
