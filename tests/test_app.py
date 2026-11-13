@@ -9,6 +9,10 @@
 6. 失败不撤销该批（注入影子重建故障）
 7. 进程重启接续未完成撤销
 8. 下载 CSV 与读取一致性
+9. 两处撤销竞态回归：
+   9a. 前任务 done 后线程仍在清理时，新受理任务自动推进，无需重启/再次点击，
+       且收尾期间请求与状态查询保持响应、导入仍可提交
+   9b. 迟到的并发撤销请求按受理时最新批次状态判断，已撤销批次不会二次进入撤销流程
 """
 import csv
 import io
@@ -16,6 +20,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -292,16 +297,40 @@ class TestSingleJobAndFailure(BaseCase):
 
 class TestRestartResume(BaseCase):
     def test_resume_unfinished_revoke_after_restart(self):
+        import sqlite3
         self.upload([("S1", "d", "PM2.5", 1.0), ("S2", "d", "SO2", 2.0)])
         self.upload([("S1", "d", "PM2.5", 999.0), ("S9", "d", "X", 5.0)])
 
-        # 在影子重建中途制造进程退出：直接把任务置 running 并建半个影子库
         manager = self.app.extensions["revoke_manager"]
-        job = manager.request_revoke(2)
-        self._wait_status("running")
-        # 模拟“进程被 kill”：后台线程仍在跑，先等它完成影子第一页再停服
-        time.sleep(0.2)
-        # 新进程：重新 create_app 同一 DB，应自动接续
+        # 确定性模拟“进程在影子重建中途被 kill”：
+        # 直接登记 running 任务并只建半份影子库，不启动任何工作线程。
+        conn = sqlite3.connect(self.db_path)
+        now = rebuild_mod.utcnow_iso()
+        shadow = os.path.join(self.tmp, "shadow_job1.db")
+        cur = conn.execute(
+            "INSERT INTO revoke_jobs (batch_id, status, snapshot_batch, keys_total,"
+            " keys_done, shadow_path, created_at, started_at)"
+            " VALUES (2, 'running', 2, 2, 0, ?, ?, ?)",
+            (shadow, now, now),
+        )
+        job_id = cur.lastrowid
+        conn.execute("UPDATE batches SET status = 'revoking' WHERE batch_id = 2")
+        conn.commit()
+        conn.close()
+
+        sh = sqlite3.connect(shadow)
+        sh.execute(
+            "CREATE TABLE shadow_results (station TEXT, sample_day TEXT, analyte TEXT,"
+            " result REAL, source_batch INTEGER,"
+            " PRIMARY KEY (station, sample_day, analyte))"
+        )
+        sh.execute(
+            "INSERT INTO shadow_results VALUES ('S1','d','PM2.5', 1.0, 1)"
+        )  # 半份：只剩 1 个键未重建
+        sh.commit()
+        sh.close()
+
+        # 新进程：重新 create_app 同一 DB，应自动接续并断点续建
         app2 = create_app(self.db_path)
         client2 = app2.test_client()
         deadline = time.time() + 20
@@ -320,6 +349,202 @@ class TestRestartResume(BaseCase):
         # 影子文件被清理
         leftovers = [f for f in os.listdir(self.tmp) if f.startswith("shadow_")]
         self.assertEqual(leftovers, [])
+        self.assertEqual(job_id, 1)
+
+    def _wait_status(self, status):
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            jobs = self.client.get("/api/jobs").get_json()
+            if jobs and jobs[0]["status"] == status:
+                return
+            time.sleep(0.02)
+        self.fail(f"job never reached {status}")
+
+
+class TestRevokeRaceConditions(BaseCase):
+    """两处撤销竞态的确定性回归（用同步闸门精确控制交错，不依赖时序碰运气）。"""
+
+    def test_job_during_cleanup_progresses_without_restart_or_reclick(self):
+        # 场景：前任务已 done，但工作线程仍在做影子文件清理（收尾窗口）；
+        # 此时受理的新任务必须被现存线程继续领取并自动推进到 done。
+        self.upload([("S1", "d", "PM2.5", 1.0), ("S1", "d", "SO2", 2.0)])  # b1
+        self.upload([("S1", "d", "PM2.5", 2.0)])                            # b2
+        self.upload([("S2", "d", "NO2", 3.0)])                              # b3
+        manager = self.app.extensions["revoke_manager"]
+
+        entered = threading.Event()
+        release = threading.Event()
+        # 补丁点选 os.remove：新旧实现都在「任务置 done 之后」用它清理影子文件，
+        # 借此稳定制造“done 已显示、线程仍在收尾”的窗口。
+        original_remove = rebuild_mod.os.remove
+
+        def slow_remove(path, *args, **kwargs):
+            if str(path).startswith(manager.data_dir) and "shadow" in str(path):
+                if not entered.is_set():
+                    entered.set()
+                # 拉长“done 之后仍在清理”的收尾窗口，稳定复现交错
+                release.wait(timeout=10)
+            return original_remove(path, *args, **kwargs)
+
+        rebuild_mod.os.remove = slow_remove
+        try:
+            resp1 = self.revoke(2)
+            self.assertEqual(resp1.status_code, 200)
+            # 等任务 1 已 done 且线程停在清理里（is_alive 仍为真）
+            self.assertTrue(entered.wait(timeout=10))
+            job1 = self.wait_job()
+            self.assertEqual(job1["status"], "done")
+            worker = manager._thread
+            self.assertIsNotNone(worker)
+            self.assertTrue(worker.is_alive())  # 收尾期间线程尚未退出
+
+            # —— 收尾窗口内：请求与状态查询保持响应 ——
+            self.assertEqual(self.client.get("/api/jobs").status_code, 200)
+            self.assertEqual(self.client.get("/api/batches").status_code, 200)
+            self.assertEqual(self.client.get("/api/results").status_code, 200)
+            # —— 导入仍可提交 ——
+            up = self.upload([("S7", "d", "O3", 7.0)])
+            self.assertEqual(up.status_code, 200)
+            self.assertTrue(up.get_json()["ok"])
+
+            # —— 受理新的撤销任务（不重启进程、不再次点击） ——
+            resp2 = self.revoke(1)
+            self.assertEqual(resp2.status_code, 200, resp2.get_data(as_text=True))
+            job2_id = resp2.get_json()["job"]["job_id"]
+
+            # 放行收尾清理；现存工作线程排空循环应自动领取任务 2
+            release.set()
+
+            deadline = time.time() + 20
+            final2 = None
+            while time.time() < deadline:
+                final2 = manager.get_job(job2_id)
+                if final2["status"] in ("done", "failed"):
+                    break
+                time.sleep(0.02)
+            self.assertIsNotNone(final2)
+            self.assertEqual(final2["status"], "done", final2)
+        finally:
+            release.set()
+            rebuild_mod.os.remove = original_remove
+
+        # 全程同一时刻只有一项在执行：不存在两条未结束任务并存
+        import sqlite3
+        conn = sqlite3.connect(self.db_path)
+        overlap = conn.execute(
+            "SELECT COUNT(*) FROM revoke_jobs WHERE status IN ('pending','running')"
+        ).fetchone()[0]
+        total = conn.execute("SELECT COUNT(*) FROM revoke_jobs").fetchone()[0]
+        statuses = {
+            r[0]: r[1]
+            for r in conn.execute("SELECT batch_id, status FROM batches").fetchall()
+        }
+        conn.close()
+        self.assertEqual(overlap, 0)
+        self.assertEqual(total, 2)
+        self.assertEqual(statuses[1], "revoked")
+        self.assertEqual(statuses[2], "revoked")
+
+    def test_late_request_judged_by_latest_status_revoked_not_readmitted(self):
+        # 场景：迟到请求在批次仍 active 时完成状态读取，随后阻塞在写锁上；
+        # 等它拿到锁时先到者已把该批撤销完成。它必须按最新状态拒绝，
+        # 已 revoked 的批次不得再次进入撤销流程。
+        self.upload([("S1", "d", "PM2.5", 1.0)])  # b1
+        self.upload([("S1", "d", "PM2.5", 2.0)])  # b2
+        import sqlite3
+
+        parked = threading.Event()      # 迟到请求已停在受理前的受控交错点
+        allow_finish = threading.Event()  # 放行迟到请求继续受理
+        local = threading.local()
+        real_connect = rebuild_mod.connect
+
+        class GatedConnection:
+            """只拦截 execute，其余属性/方法全部透传给真实连接。"""
+
+            def __init__(self, real):
+                object.__setattr__(self, "_real", real)
+
+            def execute(self, sql, parameters=()):
+                text = sql.lstrip().upper()
+                real = object.__getattribute__(self, "_real")
+                if text.startswith("BEGIN"):
+                    # 新实现：受理写事务在 BEGIN IMMEDIATE 前停车（此时尚未持写锁，
+                    # 先到者可完整完成撤销），放行后按锁内最新状态判定。
+                    parked.set()
+                    if not allow_finish.wait(timeout=10):
+                        raise TimeoutError("gate (BEGIN) not released in time")
+                    return real.execute(sql, parameters)
+                if text.startswith("SELECT * FROM BATCHES"):
+                    # 旧实现：先读到 active 的过期快照；WAL 下 SELECT 不持写锁，
+                    # 停车期间先到者仍可把批次撤销完成。
+                    row = real.execute(sql, parameters)
+                    if not allow_finish.is_set():
+                        parked.set()
+                        if not allow_finish.wait(timeout=10):
+                            raise TimeoutError("gate (SELECT) not released in time")
+                    return row
+                return real.execute(sql, parameters)
+
+            def __getattr__(self, name):
+                return getattr(object.__getattribute__(self, "_real"), name)
+
+        def gated_connect(db_path):
+            conn = real_connect(db_path)
+            if not getattr(local, "is_late", False):
+                return conn
+            return GatedConnection(conn)
+
+        results = {}
+
+        def late_request():
+            local.is_late = True
+            try:
+                results["late"] = self.revoke(2)
+            except Exception as exc:  # 线程内异常兜底，避免静默吞掉
+                results["late_exc"] = repr(exc)
+
+        rebuild_mod.connect = gated_connect
+        try:
+            t = threading.Thread(target=late_request)
+            t.start()
+            # 先让迟到请求停在受控交错点（新实现：BEGIN 前；旧实现：读到 active 后）
+            self.assertTrue(parked.wait(timeout=10))
+
+            # 先到者在此期间完整撤销批次 2
+            first = self.revoke(2)
+            self.assertEqual(first.status_code, 200, first.get_data(as_text=True))
+            job1 = self.wait_job()
+            self.assertEqual(job1["status"], "done")
+            batches = {b["batch_id"]: b["status"]
+                       for b in self.client.get("/api/batches").get_json()}
+            self.assertEqual(batches[2], "revoked")
+
+            # 放行迟到请求：此刻它才尝试进入受理写事务
+            allow_finish.set()
+            t.join(timeout=20)
+            self.assertFalse(t.is_alive())
+        finally:
+            rebuild_mod.connect = real_connect
+            allow_finish.set()
+
+        self.assertNotIn("late_exc", results)
+        late_resp = results["late"]
+        self.assertEqual(late_resp.status_code, 409)
+        self.assertIn("不可恢复", late_resp.get_json()["error"])
+
+        # 只有一笔撤销任务，批次 2 保持 revoked，没有被拉回 revoking
+        conn = sqlite3.connect(self.db_path)
+        total_jobs = conn.execute("SELECT COUNT(*) FROM revoke_jobs").fetchone()[0]
+        re_revoking = conn.execute(
+            "SELECT COUNT(*) FROM batches WHERE batch_id = 2 AND status = 'revoking'"
+        ).fetchone()[0]
+        final_status = conn.execute(
+            "SELECT status FROM batches WHERE batch_id = 2"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(total_jobs, 1)
+        self.assertEqual(re_revoking, 0)
+        self.assertEqual(final_status, "revoked")
 
     def _wait_status(self, status):
         deadline = time.time() + 5

@@ -12,7 +12,16 @@
 4. 失败：任务 failed、批次恢复 active，已撤销效果不生效，可再次请求。
 5. 重启：启动时自动接续 pending / running 的任务（影子表可断点续建）。
 
-同一时刻只允许一个撤销任务（revoke_jobs 中存在未结束任务即拒绝）。
+并发正确性（两处竞态的修复）
+----------------------------
+* 同一时刻只允许一个撤销任务，且**只存在一个常驻工作线程**。受理（request_revoke）
+  只负责把任务以 pending 落库；工作线程在循环内逐笔「加锁认领」（pending->running），
+  排空所有 pending 任务后才退出。线程退出与新任务登记共用同一把进程内锁闭环，
+  因此即使上一笔任务已显示 done、线程仍在做影子文件清理，新受理的任务也会被
+  现存（或新拉起的）线程领取，无需重启或再次点击即可推进。
+* 受理事务一律以 BEGIN IMMEDIATE 取得写锁后再读取批次状态，迟到的并发请求会
+  阻塞到先到者提交后，按锁内的**最新**批次状态判断；同时批次状态翻转使用
+  带条件的 UPDATE（仅 active 可翻转），已 revoked 的批次不会被重新拉回撤销流程。
 """
 from __future__ import annotations
 
@@ -34,28 +43,42 @@ class RevokeManager:
         self.db_path = app.config["DB_PATH"]
         self.data_dir = app.config["DATA_DIR"]
         self._thread: threading.Thread | None = None
+        # 同时保护 _thread 的生命周期判定，以及工作线程与受理线程之间的认领闭环
         self._lock = threading.Lock()
 
     # ---------- 对外入口 ----------
 
     def request_revoke(self, batch_id: int) -> dict:
-        """登记一个撤销任务并启动后台线程。返回任务信息字典。"""
+        """登记一个撤销任务并确保后台工作线程运行。返回任务信息字典。
+
+        受理全程在一个 BEGIN IMMEDIATE 写事务内完成：并发的撤销请求在
+        SQLite 写锁上排队，后到者读到的一定是先到者提交后的最新批次状态，
+        从而按受理时刻的最新状态决定是否受理。
+        """
         conn = connect(self.db_path)
+        job_id = None
         try:
+            # IMMEDIATE 立刻取得写锁：迟到请求在此排队，不会基于过期的
+            # active 快照做决策，也不会与另一笔受理交错产生双任务。
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT * FROM batches WHERE batch_id = ?", (batch_id,)
             ).fetchone()
             if row is None:
+                conn.rollback()
                 raise LookupError(f"批次 {batch_id} 不存在")
             if row["status"] != "active":
+                conn.rollback()
                 raise ValueError(
                     f"批次 {batch_id} 当前状态为 {row['status']}，"
                     "只有 active 批次可以撤销（已撤销批次不可恢复）"
                 )
             busy = conn.execute(
-                "SELECT COUNT(*) AS n FROM revoke_jobs WHERE status IN ('pending', 'running')"
+                "SELECT COUNT(*) AS n FROM revoke_jobs"
+                " WHERE status IN ('pending', 'running')"
             ).fetchone()["n"]
             if busy:
+                conn.rollback()
                 raise RuntimeError("已有撤销任务在进行中，同一时刻只允许一项")
 
             snapshot = conn.execute(
@@ -69,42 +92,55 @@ class RevokeManager:
                     (batch_id, snapshot, now),
                 )
                 job_id = cur.lastrowid
-                conn.execute(
-                    "UPDATE batches SET status = 'revoking' WHERE batch_id = ?", (batch_id,)
+                # 条件更新：仅 active 批次可进入 revoking。若批次已在锁等待期间
+                # 被另一笔已提交事务撤销（status=revoked），rowcount 为 0，
+                # 立即回滚，绝不让已撤销批次再次进入撤销流程。
+                cur = conn.execute(
+                    "UPDATE batches SET status = 'revoking'"
+                    " WHERE batch_id = ? AND status = 'active'",
+                    (batch_id,),
                 )
+                if cur.rowcount == 0:
+                    conn.rollback()
+                    job_id = None
+                    raise RuntimeError(
+                        f"批次 {batch_id} 已不再是 active，按最新状态拒绝受理"
+                    )
                 conn.commit()
             except sqlite3.IntegrityError:
+                # 部分唯一索引兜底：极端交错下仍有未结束任务时直接拒绝
                 conn.rollback()
+                job_id = None
                 raise RuntimeError("已有撤销任务在进行中，同一时刻只允许一项")
         finally:
             conn.close()
 
-        self.spawn(job_id)
+        # 受理只落库为 pending；工作线程负责认领，保证全局只有一项在跑
+        self.spawn()
         return self.get_job(job_id)
 
-    def spawn(self, job_id: int) -> None:
-        """确保有一个后台工作线程处理任务（启动恢复 / 新任务共用）。"""
+    def spawn(self) -> None:
+        """确保有且仅有一个后台工作线程（启动恢复 / 新任务共用）。
+
+        工作线程排空所有 pending 任务后才会退出；其退出清空 _thread 与本方法
+        在同一把锁内完成，因此「上一线程仍在收尾清理」时新任务不会无人领取。
+        """
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return
-            t = threading.Thread(target=self._run_guarded, args=(job_id,), daemon=True)
+            t = threading.Thread(target=self._worker_guarded, daemon=True)
             self._thread = t
         t.start()
 
-    def resume_on_startup(self) -> int | None:
-        """进程启动后接续未完成的撤销任务，返回恢复的任务 id（没有则 None）。"""
-        conn = connect(self.db_path)
-        try:
-            row = conn.execute(
-                "SELECT job_id FROM revoke_jobs WHERE status IN ('pending', 'running')"
-                " ORDER BY job_id LIMIT 1"
-            ).fetchone()
-        finally:
-            conn.close()
-        if row is not None:
-            self.spawn(row["job_id"])
-            return row["job_id"]
-        return None
+    def resume_on_startup(self) -> bool:
+        """进程启动后确保工作线程运行，以接续未完成的撤销任务。
+
+        任务认领（含把崩溃遗留的 running 复位为 pending）统一由工作线程完成，
+        这里只需保证线程存在；返回是否启动了新线程。
+        """
+        had_thread = self._thread is not None and self._thread.is_alive()
+        self.spawn()
+        return not had_thread
 
     def get_job(self, job_id: int) -> dict | None:
         conn = connect(self.db_path)
@@ -126,31 +162,73 @@ class RevokeManager:
 
     # ---------- 后台工作线程 ----------
 
-    def _run_guarded(self, job_id: int) -> None:
+    def _worker_guarded(self) -> None:
+        """工作线程外壳：循环认领并处理任务，排空后在锁内清空线程引用。"""
         with self.app.app_context():
             try:
-                self._run(job_id)
-            except Exception as exc:  # 任何失败都不能让批次“半撤销”
-                self._fail(job_id, exc)
+                while True:
+                    job = self._claim_next()
+                    if job is None:
+                        return
+                    try:
+                        self._run(job["job_id"])
+                    except Exception as exc:  # 任何失败都不能让批次“半撤销”
+                        self._fail(job["job_id"], exc)
+                    # 无论成功/失败都继续循环：处理在收尾期间新登记的 pending 任务
+            finally:
+                with self._lock:
+                    # 仅当引用的还是自己时才清空，避免误清新拉起的线程
+                    if self._thread is threading.current_thread():
+                        self._thread = None
+
+    def _claim_next(self) -> dict | None:
+        """在单个写事务内认领下一笔待处理任务，返回其行；没有则返回 None。
+
+        - 崩溃/重启遗留的 running 任务先复位为 pending（影子库可断点续建）。
+        - 认领即 pending -> running，配合部分唯一索引保证同一时刻仅一项在执行。
+        """
+        conn = connect(self.db_path)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            # 上次进程被 kill 时停在 running 的任务复位，等待重新认领
+            conn.execute(
+                "UPDATE revoke_jobs SET status = 'pending'"
+                " WHERE status = 'running'"
+            )
+            row = conn.execute(
+                "SELECT * FROM revoke_jobs WHERE status = 'pending'"
+                " ORDER BY job_id LIMIT 1"
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return None
+            shadow_path = row["shadow_path"] or os.path.join(
+                self.data_dir, f"shadow_job{row['job_id']}.db"
+            )
+            conn.execute(
+                "UPDATE revoke_jobs SET status = 'running',"
+                " started_at = COALESCE(started_at, ?), shadow_path = ?"
+                " WHERE job_id = ? AND status = 'pending'",
+                (utcnow_iso(), shadow_path, row["job_id"]),
+            )
+            conn.commit()
+            job = dict(row)
+            job["status"] = "running"
+            job["shadow_path"] = shadow_path
+            return job
+        finally:
+            conn.close()
 
     def _run(self, job_id: int) -> None:
         conn = connect(self.db_path)
         try:
             job = conn.execute("SELECT * FROM revoke_jobs WHERE job_id = ?", (job_id,)).fetchone()
-            if job is None:
-                return
-            if job["status"] == "done":
+            if job is None or job["status"] == "done":
                 return
             batch_id = job["batch_id"]
             shadow_path = job["shadow_path"] or os.path.join(
                 self.data_dir, f"shadow_job{job_id}.db"
             )
-            conn.execute(
-                "UPDATE revoke_jobs SET status = 'running', started_at = COALESCE(started_at, ?),"
-                " shadow_path = ? WHERE job_id = ?",
-                (utcnow_iso(), shadow_path, job_id),
-            )
-            conn.commit()
         finally:
             conn.close()
 
@@ -166,10 +244,16 @@ class RevokeManager:
             conn.commit()
         finally:
             conn.close()
-        try:
-            os.remove(shadow_path)
-        except OSError:
-            pass
+        # 影子文件清理放在 done 之后；清理耗时不影响后续任务被工作线程继续领取
+        self._cleanup_shadow(shadow_path)
+
+    def _cleanup_shadow(self, shadow_path: str) -> None:
+        """删除影子库文件（含 WAL 旁路文件）；失败仅忽略，不影响任务结果。"""
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(shadow_path + suffix)
+            except OSError:
+                pass
 
     def _fail(self, job_id: int, exc: Exception) -> None:
         self.app.logger.exception("revoke job %s failed", job_id)
@@ -197,11 +281,7 @@ class RevokeManager:
             conn.close()
         # 清理失败任务的影子文件（重试会生成新的）
         if shadow_path:
-            for suffix in ("", "-wal", "-shm"):
-                try:
-                    os.remove(shadow_path + suffix)
-                except OSError:
-                    pass
+            self._cleanup_shadow(shadow_path)
 
     # ---------- 步骤 1：影子库重建（不占正式库写事务） ----------
 
